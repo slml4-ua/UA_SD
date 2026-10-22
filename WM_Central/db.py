@@ -21,7 +21,14 @@ DESCONECTADA = "DESCONECTADA"
  
 _lock = threading.Lock()
 _conn = None
- 
+
+# Columnas añadidas después de la primera versión de las tablas
+_COLUMNAS_NUEVAS = [
+    ("ws", "bloqueada", "INTEGER DEFAULT 0"),
+    ("irrigation", "req_id", "TEXT"),
+    ("irrigation", "duracion_prevista", "INTEGER"),
+    ("irrigation", "duracion_real", "REAL"),
+] 
  
 def init():
     """Abre la BD, crea las tablas y deja todas las WS como DESCONECTADA.
@@ -67,6 +74,14 @@ def init():
             )
         _conn.execute(
             "UPDATE ws SET estado = ?, caudal = 0, operator_id = NULL", (DESCONECTADA,)
+        )
+
+        for tabla, columna, tipo in _COLUMNAS_NUEVAS:
+            existentes = [f["name"] for f in _conn.execute(f"PRAGMA table_info({tabla})")]
+            if columna not in existentes:
+                _conn.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {tipo}")
+        _conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_irrigation_req ON irrigation(req_id)"
         )
         _conn.commit()
  
@@ -122,3 +137,75 @@ def set_estado(ws_id, estado):
             (estado, time.time(), ws_id),
         )
         _conn.commit()
+
+
+def operator_exists(operator_id) -> bool:
+    with _lock:
+        fila = _conn.execute(
+            "SELECT 1 FROM operator WHERE id = ?", (operator_id,)
+        ).fetchone()
+        return fila is not None
+
+
+def get_riego(req_id):
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM irrigation WHERE req_id = ?", (req_id,)
+        ).fetchone()
+
+
+def riegos_abiertos():
+    """Riegos autorizados que todavía no han terminado."""
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM irrigation WHERE fin IS NULL AND req_id IS NOT NULL"
+        ).fetchall()
+
+
+def volumenes_totales():
+    """Agua total suministrada por cada WS en riegos ya terminados."""
+    with _lock:
+        filas = _conn.execute(
+            "SELECT ws_id, COALESCE(SUM(volumen), 0) AS total "
+            "FROM irrigation WHERE fin IS NOT NULL GROUP BY ws_id"
+        ).fetchall()
+    return {f["ws_id"]: f["total"] for f in filas}
+
+
+def set_bloqueada(ws_id, bloqueada):
+    with _lock:
+        _conn.execute(
+            "UPDATE ws SET bloqueada = ? WHERE id = ?", (1 if bloqueada else 0, ws_id)
+        )
+        _conn.commit()
+
+
+def crear_riego(req_id, ws_id, operator_id, duracion):
+    """Registra un riego autorizado. Si el req_id ya existe no hace nada.
+
+    Devuelve (fila, es_nuevo).
+    """
+    with _lock:
+        cursor = _conn.execute(
+            "INSERT OR IGNORE INTO irrigation "
+            "(req_id, ws_id, operator_id, duracion_prevista, inicio) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (req_id, ws_id, operator_id, duracion, time.time()),
+        )
+        _conn.commit()
+        fila = _conn.execute(
+            "SELECT * FROM irrigation WHERE req_id = ?", (req_id,)
+        ).fetchone()
+        return fila, cursor.rowcount > 0
+
+
+def cerrar_riego(req_id, volumen, duracion, motivo):
+    """Anota el resultado final de un riego. Devuelve True si estaba abierto."""
+    with _lock:
+        cursor = _conn.execute(
+            "UPDATE irrigation SET fin = ?, volumen = ?, duracion_real = ?, "
+            "motivo_fin = ? WHERE req_id = ? AND fin IS NULL",
+            (time.time(), volumen, duracion, motivo, req_id),
+        )
+        _conn.commit()
+        return cursor.rowcount > 0
