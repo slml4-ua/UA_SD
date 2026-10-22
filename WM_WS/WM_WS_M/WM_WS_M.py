@@ -172,6 +172,63 @@ class EnlaceEngine:
         return respuesta == "OK"
 
 
+class Estado:
+    """Lo que el Monitor sabe de su estación (lo escribe un hilo y lo lee otro)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.averia = True  # hasta comprobar que el Engine responde OK
+
+    def fijar(self, averia):
+        with self.lock:
+            self.averia = averia
+
+    def leer(self):
+        with self.lock:
+            return self.averia
+
+
+def hilo_central(central, estado, ws_id):
+    """Mantiene informada a Central: avería/recuperación y señal de vida.
+
+    Va en su propio hilo para que, si Central no responde, las comprobaciones
+    de salud al Engine (una por segundo) no se retrasen.
+    """
+    notificado = None  # último estado comunicado a Central (True = avería)
+    epoca_notificada = -1
+    ciclos = 0
+    central_ok = True
+    while True:
+        averia = estado.leer()
+        ciclos += 1
+        if averia != notificado or central.epoca != epoca_notificada:
+            # Central también debe enterarse tras reiniciarse (nueva época)
+            respuesta = central.enviar(f"{'FAULT' if averia else 'RECOVERED'}#{ws_id}")
+            if respuesta is not None:
+                notificado, epoca_notificada = averia, central.epoca
+                if not central_ok:
+                    log("Conexión con WM_Central restablecida")
+                central_ok = True
+                log(
+                    "Estación AVERIADA: aviso enviado a Central"
+                    if averia
+                    else "Estación operativa: Central informada"
+                )
+            elif central_ok:
+                central_ok = False
+                log("Imposible conectar con WM_Central")
+        elif ciclos % SEGUNDOS_ENTRE_PINGS == 0:
+            # Señal de vida: así Central sabe que el Monitor sigue ahí
+            respuesta = central.enviar(f"PING#{ws_id}")
+            if respuesta is None and central_ok:
+                central_ok = False
+                log("Imposible conectar con WM_Central")
+            elif respuesta is not None and not central_ok:
+                central_ok = True
+                log("Conexión con WM_Central restablecida")
+        time.sleep(1)
+
+
 def main():
     if len(sys.argv) != 6:
         print(
@@ -195,33 +252,26 @@ def main():
     engine = EnlaceEngine(puerto_engine, ws_id)
     threading.Thread(target=engine.aceptar_conexiones, daemon=True).start()
 
-    averia = False
-    epoca_notificada = central.epoca
-    ciclos = 0
+    estado = Estado()
+    threading.Thread(
+        target=hilo_central, args=(central, estado, ws_id), daemon=True
+    ).start()
+
+    engine_ok = None
     try:
         while True:
             inicio = time.time()
             sano = engine.comprobar_salud()
-            ciclos += 1
-            if ciclos % SEGUNDOS_ENTRE_PINGS == 0:
-                # Mantiene viva la conexión y detecta si Central se ha caído
-                central.enviar(f"PING#{ws_id}")
-
-            if sano is False and not averia:
-                averia = True
-                log("AVERIA: el Engine responde KO o no responde")
-                central.enviar(f"FAULT#{ws_id}")
-                epoca_notificada = central.epoca
-            elif sano and averia:
-                averia = False
-                log("Avería resuelta, el Engine vuelve a responder OK")
-                central.enviar(f"RECOVERED#{ws_id}")
-                epoca_notificada = central.epoca
-            elif averia and central.epoca != epoca_notificada:
-                # Central se ha reconectado y no conoce la avería en curso
-                central.enviar(f"FAULT#{ws_id}")
-                epoca_notificada = central.epoca
-
+            # Un Engine que aún no se ha conectado cuenta como averiado
+            averia = not sano
+            if averia != estado.leer():
+                estado.fijar(averia)
+            if sano is not engine_ok and not (sano is None and engine_ok is None):
+                engine_ok = sano
+                if sano:
+                    log("Engine OK")
+                elif sano is False:
+                    log("AVERIA: el Engine responde KO o no responde")
             time.sleep(max(0.0, INTERVALO_SALUD - (time.time() - inicio)))
     except KeyboardInterrupt:
         log("Monitor detenido")
