@@ -5,22 +5,32 @@ Uso:
 
 Se conecta a su WM_WS_M por sockets (el Monitor le pregunta su salud cada
 segundo y le indica el ID de la estación) y por Kafka recibe las órdenes de
-Central y publica el caudal y el volumen del riego.
+Central y publica el caudal, el volumen y el resultado de cada riego.
 
 Topics de Kafka (mensajes en JSON):
-    ws_commands   Central -> Engine
-        {"ws_id": "WS1" | "ALL", "cmd": "START", "operator_id": "OP1", "duracion": 30}
-        {"ws_id": "WS1" | "ALL", "cmd": "STOP" | "BLOCK" | "ACTIVATE"}
-    ws_telemetry  Engine -> Central
-        {"type": "TELEMETRY", "ws_id", "operator_id", "caudal", "volumen"}
-        {"type": "FINISHED", "ws_id", "operator_id", "volumen", "duracion", "motivo"}
-        {"type": "MANUAL_REQUEST", "ws_id", "duracion"}
+    ws_commands        Central -> Engine
+        {"cmd": "START", "ws_id", "req_id", "operator_id", "duracion", "ts"}
+        {"cmd": "STOP" | "BLOCK" | "ACTIVATE", "ws_id": "WS1" | "ALL", ...}
+        {"cmd": "ACK_FINISHED" | "DENIED", "ws_id", "req_id", ...}
+    ws_telemetry       Engine -> Central
+        {"type": "TELEMETRY", "ws_id", "req_id", "operator_id", "caudal", "volumen"}
+        {"type": "FINISHED", "ws_id", "req_id", "operator_id", "volumen",
+         "duracion", "motivo"}
+        {"type": "MANUAL_REQUEST", "ws_id", "req_id", "operator_id", "duracion", "ts"}
+    central_heartbeat  Central -> todos (señal de vida de Central)
+
+El resultado de cada riego se guarda en un fichero local antes de enviarse y se
+reenvía hasta que Central confirma que lo ha registrado, de modo que no se
+pierde aunque Central, Kafka o el propio Engine se caigan. La carpeta del
+fichero se indica con la variable de entorno WM_DATA_DIR (por defecto, la
+carpeta actual).
 
 Menú local: permite pedir un riego manual, finalizarlo y simular (o quitar)
 una fuga pulsando una opción.
 """
 
 import json
+import os
 import random
 import socket
 import sys
@@ -28,20 +38,25 @@ import threading
 import time
 import uuid
 
-from kafka import KafkaConsumer, KafkaProducer
-
+import bus
 import protocol
 
 TOPIC_COMANDOS = "ws_commands"
 TOPIC_TELEMETRIA = "ws_telemetry"
+TOPIC_LATIDO = "central_heartbeat"
 
 DISPONIBLE = "DISPONIBLE"
 REGANDO = "REGANDO"
 FUGA = "FUGA"
 FUERA_DE_SERVICIO = "FUERA_DE_SERVICIO"
+AVERIADA = "AVERIADA"  # sin comunicación con su Monitor
 
 DURACION_POR_DEFECTO = 20
 ESPERA_REINTENTO = 2.0
+LIMITE_SILENCIO_MONITOR = 5.0  # s sin preguntas del Monitor => estación averiada
+LIMITE_SILENCIO_CENTRAL = 5.0  # s sin latido de Central => Central caída
+CADUCIDAD_ORDEN = 15.0  # una orden START más antigua no se ejecuta
+SEGUNDOS_ENTRE_REENVIOS = 5.0
 
 _print_lock = threading.Lock()
 
@@ -51,140 +66,263 @@ def log(mensaje):
         print(f"[{time.strftime('%H:%M:%S')}] {mensaje}", flush=True)
 
 
-def crear_productor(broker):
-    while True:
-        try:
-            return KafkaProducer(
-                bootstrap_servers=broker,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            )
-        except Exception as e:
-            log(f"No se puede conectar con Kafka ({e}); reintentando...")
-            time.sleep(ESPERA_REINTENTO)
-
-
-def crear_consumidor(broker):
-    # Un grupo distinto en cada ejecución: Kafka no recuerda lo ya leído, así que
-    # al reiniciar el Engine no se repiten órdenes antiguas. Con un grupo
-    # compartido, además, Kafka repartiría los mensajes entre las estaciones en
-    # vez de entregárselos a todas.
-    grupo = f"ws-engine-{uuid.uuid4().hex[:8]}"
-    while True:
-        try:
-            return KafkaConsumer(
-                TOPIC_COMANDOS,
-                bootstrap_servers=broker,
-                group_id=grupo,
-                auto_offset_reset="latest",
-                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-            )
-        except Exception as e:
-            log(f"No se puede conectar con Kafka ({e}); reintentando...")
-            time.sleep(ESPERA_REINTENTO)
-
-
 class Engine:
-    def __init__(self, broker):
+    def __init__(self, broker, directorio="."):
         self.broker = broker
+        self.directorio = directorio
         self.lock = threading.RLock()
         self.productor = None
         self.ws_id = None  # lo comunica el Monitor en la primera comprobación
 
         self.fallo = False  # fuga simulada
         self.bloqueada = False  # fuera de servicio por orden de Central
-        self.regando = False
-        self.operador = None
-        self.caudal = 0.0
-        self.volumen = 0.0
-        self.inicio = 0.0
-        self.duracion = 0
+        self.riego = None  # riego en curso (dict)
+        self.pendientes = {}  # req_id -> FINISHED que Central aún no ha confirmado
+        self.vistos = []  # req_id de las órdenes START ya tratadas
+        self.ultimo_envio = {}  # req_id -> instante del último envío del resultado
+
+        self.ultimo_health = 0.0  # última pregunta recibida del Monitor
+        self.ultimo_latido = 0.0  # último latido recibido de Central
+        self.monitor_estaba_ok = None
+        self.central_estaba_ok = None
+        self.comandos_listos = threading.Event()
+        self.arranque = time.time()
 
     # ------------------------------------------------------------- estado
 
     @property
+    def monitor_ok(self):
+        return (
+            self.ws_id is not None
+            and time.time() - self.ultimo_health < LIMITE_SILENCIO_MONITOR
+        )
+
+    @property
+    def central_ok(self):
+        return time.time() - self.ultimo_latido < LIMITE_SILENCIO_CENTRAL
+
+    @property
+    def regando(self):
+        return self.riego is not None
+
+    @property
     def estado(self):
+        if not self.monitor_ok:
+            return AVERIADA
         if self.fallo:
             return FUGA
         if self.bloqueada:
             return FUERA_DE_SERVICIO
-        if self.regando:
+        if self.riego is not None:
             return REGANDO
         return DISPONIBLE
 
-    def _publicar(self, mensaje):
-        if self.productor is not None:
-            self.productor.send(TOPIC_TELEMETRIA, mensaje)
+    def motivo_no_disponible(self):
+        """Por qué no puede iniciarse un riego ahora (None si puede)."""
+        if not self.monitor_ok:
+            return "estación AVERIADA: sin comunicación con su Monitor"
+        if self.fallo:
+            return "estación con FUGA"
+        if self.bloqueada:
+            return "estación FUERA DE SERVICIO"
+        if self.riego is not None:
+            return "ya hay un riego en curso"
+        return None
+
+    # --------------------------------------------------------- persistencia
+
+    def _ruta(self):
+        return os.path.join(self.directorio, f"engine_{self.ws_id}.json")
+
+    def guardar(self):
+        """Guarda el estado en disco (se llama con el candado cogido)."""
+        if self.ws_id is None:
+            return
+        datos = {
+            "bloqueada": self.bloqueada,
+            "riego": self.riego,
+            "pendientes": list(self.pendientes.values()),
+            "vistos": self.vistos[-100:],
+        }
+        ruta = self._ruta()
+        temporal = ruta + ".tmp"
+        try:
+            os.makedirs(self.directorio, exist_ok=True)
+            with open(temporal, "w", encoding="utf-8") as f:
+                json.dump(datos, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporal, ruta)
+        except OSError as e:
+            log(f"No se pudo guardar el estado en disco: {e}")
+
+    def cargar(self):
+        """Recupera el estado guardado, incluido un riego que quedó a medias."""
+        try:
+            with open(self._ruta(), encoding="utf-8") as f:
+                datos = json.load(f)
+        except (OSError, ValueError):
+            return
+        with self.lock:
+            self.bloqueada = bool(datos.get("bloqueada"))
+            self.vistos = list(datos.get("vistos", []))
+            for mensaje in datos.get("pendientes", []):
+                self.pendientes[mensaje["req_id"]] = mensaje
+            riego = datos.get("riego")
+            if riego:
+                # El Engine se cayó durante un riego: se conserva lo ya regado
+                mensaje = self._mensaje_fin(riego, "ENGINE_CAIDO", riego.get("ultimo"))
+                self.pendientes[riego["req_id"]] = mensaje
+                log(
+                    f"Riego interrumpido por una caída: se recupera su resultado "
+                    f"({mensaje['volumen']:.1f} L)"
+                )
+            self.guardar()
+        if self.bloqueada:
+            log("Estación FUERA DE SERVICIO (recuperado del estado guardado)")
+
+    # ------------------------------------------------------------- Kafka
+
+    def _publicar(self, mensaje, confirmar=True, espera=None):
+        if self.productor is None:
+            return False
+        return bus.enviar(
+            self.productor, TOPIC_TELEMETRIA, mensaje, espera=espera, confirmar=confirmar
+        )
+
+    def _mensaje_fin(self, riego, motivo, instante=None):
+        instante = instante or time.time()
+        return {
+            "type": "FINISHED",
+            "ws_id": self.ws_id,
+            "req_id": riego["req_id"],
+            "operator_id": riego["operador"],
+            "volumen": round(riego["volumen"], 2),
+            "duracion": round(max(0.0, instante - riego["inicio"]), 1),
+            "motivo": motivo,
+        }
+
+    def _enviar_resultado(self, mensaje):
+        self.ultimo_envio[mensaje["req_id"]] = time.time()
+        self._publicar(mensaje, espera=3)
 
     # ------------------------------------------------------------- riego
 
-    def iniciar_riego(self, operador, duracion):
+    def iniciar_riego(self, req_id, operador, duracion, ts):
         with self.lock:
-            if self.estado != DISPONIBLE:
-                log(f"Orden de riego ignorada: la estación está {self.estado}")
-                return False
-            self.regando = True
-            self.operador = operador
-            self.volumen = 0.0
-            self.caudal = random.uniform(8, 12)
-            self.inicio = time.time()
-            self.duracion = duracion
-            log(f"Electroválvula ABIERTA - riego para {operador} durante {duracion} s")
-            return True
-
-    def finalizar_riego(self, motivo):
-        with self.lock:
-            if not self.regando:
-                return False
-            duracion = time.time() - self.inicio
-            self._publicar(
-                {
-                    "type": "FINISHED",
-                    "ws_id": self.ws_id,
-                    "operator_id": self.operador,
-                    "volumen": round(self.volumen, 2),
-                    "duracion": round(duracion, 1),
-                    "motivo": motivo,
+            if not req_id:
+                return
+            if req_id in self.vistos or (self.riego and self.riego["req_id"] == req_id):
+                return  # orden repetida
+            self.vistos.append(req_id)
+            motivo = self.motivo_no_disponible()
+            if motivo is None and time.time() - ts > CADUCIDAD_ORDEN:
+                motivo = "la orden llegó demasiado tarde"
+            if motivo is not None:
+                log(f"Orden de riego ignorada: {motivo}")
+                mensaje = {
+                    "type": "FINISHED", "ws_id": self.ws_id, "req_id": req_id,
+                    "operator_id": operador, "volumen": 0.0, "duracion": 0.0,
+                    "motivo": "NO_INICIADO",
                 }
-            )
+                self.pendientes[req_id] = mensaje
+                self.guardar()
+            else:
+                ahora = time.time()
+                self.riego = {
+                    "req_id": req_id,
+                    "operador": operador,
+                    "inicio": ahora,
+                    "ultimo": ahora,
+                    "duracion": duracion,
+                    "volumen": 0.0,
+                    "caudal": random.uniform(8, 12),
+                }
+                self.guardar()
+                log(f"Electroválvula ABIERTA - riego para {operador} durante {duracion} s")
+                mensaje = None
+        if mensaje is None:
+            return
+        self._enviar_resultado(mensaje)
+
+    def finalizar_riego(self, motivo, req_id=None):
+        """Cierra el riego en curso. Devuelve True si había alguno que cerrar."""
+        with self.lock:
+            riego = self.riego
+            if riego is None or (req_id and riego["req_id"] != req_id):
+                return False
+            mensaje = self._mensaje_fin(riego, motivo)
+            self.riego = None
+            self.pendientes[riego["req_id"]] = mensaje
+            self.guardar()
             log(
-                f"Electroválvula CERRADA ({motivo}) - {self.volumen:.1f} L "
-                f"en {duracion:.0f} s"
+                f"Electroválvula CERRADA ({motivo}) - {mensaje['volumen']:.1f} L "
+                f"en {mensaje['duracion']:.0f} s"
             )
-            self.regando = False
-            self.operador = None
-            self.caudal = 0.0
-            return True
+        self._enviar_resultado(mensaje)
+        return True
 
     def tick(self):
         """Se llama cada segundo: mide el caudal y publica la telemetría."""
+        self._vigilar()
         with self.lock:
-            if not self.regando:
+            riego = self.riego
+            if riego is None:
                 return
-            if time.time() - self.inicio >= self.duracion:
+            ahora = time.time()
+            if not self.monitor_ok:
+                log("Sin comunicación con el Monitor: se cierra el riego")
+                self.finalizar_riego("MONITOR")
+                return
+            if ahora - riego["inicio"] >= riego["duracion"]:
                 self.finalizar_riego("TIEMPO")
                 return
-            self.caudal = random.uniform(8, 12)
-            self.volumen += self.caudal / 60
-            self._publicar(
-                {
-                    "type": "TELEMETRY",
-                    "ws_id": self.ws_id,
-                    "operator_id": self.operador,
-                    "caudal": round(self.caudal, 2),
-                    "volumen": round(self.volumen, 2),
-                }
-            )
-            log(f"REGANDO  {self.caudal:5.1f} L/min  {self.volumen:7.1f} L")
+            riego["caudal"] = random.uniform(8, 12)
+            riego["volumen"] += riego["caudal"] / 60
+            riego["ultimo"] = ahora
+            self.guardar()
+            mensaje = {
+                "type": "TELEMETRY",
+                "ws_id": self.ws_id,
+                "req_id": riego["req_id"],
+                "operator_id": riego["operador"],
+                "caudal": round(riego["caudal"], 2),
+                "volumen": round(riego["volumen"], 2),
+            }
+            log(f"REGANDO  {riego['caudal']:5.1f} L/min  {riego['volumen']:7.1f} L")
+        self._publicar(mensaje, confirmar=False)
+
+    def _vigilar(self):
+        """Avisa por pantalla cuando cambia la conexión con el Monitor o con Central."""
+        monitor, central = self.monitor_ok, self.central_ok
+        if self.ws_id is not None and monitor != self.monitor_estaba_ok:
+            if monitor:
+                if self.monitor_estaba_ok is not None:
+                    log("Monitor recuperado: la estación vuelve a estar operativa")
+            else:
+                log("AVERIADA: sin comunicación con el Monitor. No se admiten riegos")
+            self.monitor_estaba_ok = monitor
+        if central != self.central_estaba_ok:
+            if central:
+                if self.central_estaba_ok is not None:
+                    log("Conexión con WM_Central restablecida")
+            else:
+                if self.central_estaba_ok is None and time.time() - self.arranque < 10:
+                    return  # recién arrancado: aún no ha dado tiempo a oír a Central
+                log("Imposible conectar con WM_Central")
+            self.central_estaba_ok = central
 
     def bloquear(self):
         with self.lock:
             self.finalizar_riego("CENTRAL")
             self.bloqueada = True
+            self.guardar()
             log("Estación FUERA DE SERVICIO por orden de Central")
 
     def activar(self):
         with self.lock:
             self.bloqueada = False
+            self.guardar()
             log("Estación ACTIVADA por orden de Central")
 
     def alternar_fallo(self):
@@ -198,16 +336,34 @@ class Engine:
                 log("Fuga resuelta: el Engine vuelve a responder OK")
             return self.fallo
 
-    def solicitar_manual(self, duracion):
+    def solicitar_manual(self, operador, duracion):
         """Petición de riego hecha desde el menú de la propia estación."""
         if self.ws_id is None:
             log("Aún no se conoce el ID de la estación (esperando al Monitor)")
             return False
-        self._publicar(
-            {"type": "MANUAL_REQUEST", "ws_id": self.ws_id, "duracion": duracion}
+        motivo = self.motivo_no_disponible()
+        if motivo is not None:
+            log(f"No se admite el riego: {motivo}")
+            return False
+        if not self.central_ok:
+            log("Imposible conectar con WM_Central: no se admiten riegos nuevos")
+            return False
+        enviada = self._publicar(
+            {
+                "type": "MANUAL_REQUEST",
+                "ws_id": self.ws_id,
+                "req_id": uuid.uuid4().hex[:12],
+                "operator_id": operador,
+                "duracion": duracion,
+                "ts": time.time(),
+            },
+            espera=10,
         )
-        log("Petición de riego manual enviada a Central")
-        return True
+        if enviada:
+            log("Petición de riego manual enviada a Central")
+        else:
+            log("Imposible conectar con Kafka: la petición no se ha enviado")
+        return enviada
 
     # --------------------------------------------------------- Kafka (órdenes)
 
@@ -218,27 +374,74 @@ class Engine:
         orden = mensaje.get("cmd")
         if orden == "START":
             self.iniciar_riego(
+                mensaje.get("req_id"),
                 mensaje.get("operator_id"),
                 mensaje.get("duracion", DURACION_POR_DEFECTO),
+                mensaje.get("ts", 0),
             )
         elif orden == "STOP":
-            self.finalizar_riego("CENTRAL")
+            self.finalizar_riego("CENTRAL", mensaje.get("req_id"))
         elif orden == "BLOCK":
             self.bloquear()
         elif orden == "ACTIVATE":
             self.activar()
+        elif orden == "ACK_FINISHED":
+            with self.lock:
+                if self.pendientes.pop(mensaje.get("req_id"), None) is not None:
+                    self.ultimo_envio.pop(mensaje.get("req_id"), None)
+                    self.guardar()
+        elif orden == "DENIED":
+            log(f"Central deniega el riego: {mensaje.get('motivo')}")
 
-    def hilo_comandos(self):
-        consumidor = crear_consumidor(self.broker)
-        for mensaje in consumidor:
-            self.manejar_comando(mensaje.value)
+    def hilo_comandos(self, lector):
+        for mensaje in lector.mensajes():
+            try:
+                self.manejar_comando(mensaje)
+            except Exception as e:
+                log(f"Error al procesar una orden: {e!r}")
+
+    def hilo_latido(self):
+        lector = bus.Lector(
+            self.broker, [TOPIC_LATIDO], f"ws-latido-{uuid.uuid4().hex[:8]}", log=log
+        )
+        for _ in lector.mensajes():
+            self.ultimo_latido = time.time()
 
     def hilo_tick(self):
         while True:
             time.sleep(1)
-            self.tick()
+            try:
+                self.tick()
+            except Exception as e:
+                log(f"Error en el ciclo de riego: {e!r}")
+
+    def hilo_reenvio(self):
+        """Reenvía los resultados que Central todavía no ha confirmado."""
+        while True:
+            time.sleep(1)
+            if not self.central_ok:
+                continue
+            with self.lock:
+                pendientes = [
+                    m for m in self.pendientes.values()
+                    if time.time() - self.ultimo_envio.get(m["req_id"], 0)
+                    >= SEGUNDOS_ENTRE_REENVIOS
+                ]
+            for mensaje in pendientes:
+                self._enviar_resultado(mensaje)
 
     # -------------------------------------------------------- sockets (Monitor)
+
+    def asignar_id(self, ws_id):
+        """Primera comprobación del Monitor: fija el ID y arranca el lector de órdenes."""
+        self.ws_id = ws_id
+        log(f"Estación asignada: {ws_id}")
+        self.cargar()
+        lector = bus.Lector(
+            self.broker, [TOPIC_COMANDOS], f"ws-engine-{ws_id}", log=log
+        )
+        self.comandos_listos = lector.listo
+        threading.Thread(target=self.hilo_comandos, args=(lector,), daemon=True).start()
 
     def hilo_monitor(self, ip, puerto):
         """Mantiene la conexión con el Monitor y responde a sus comprobaciones."""
@@ -254,10 +457,11 @@ class Engine:
                             break
                         campos = texto.split(protocol.SEP)
                         if campos[0] == "HEALTH" and len(campos) == 2:
+                            self.ultimo_health = time.time()
                             if self.ws_id is None:
-                                self.ws_id = campos[1]
-                                log(f"Estación asignada: {self.ws_id}")
-                            respuesta = "KO" if self.fallo else "OK"
+                                self.asignar_id(campos[1])
+                            sano = not self.fallo and self.comandos_listos.is_set()
+                            respuesta = "OK" if sano else "KO"
                         else:
                             respuesta = "KO"
                         protocol.server_send_answer(sock, respuesta)
@@ -268,12 +472,13 @@ class Engine:
 
 
 def arrancar(engine, ip_monitor, puerto_monitor):
-    engine.productor = crear_productor(engine.broker)
+    engine.productor = bus.crear_productor(engine.broker, log)
     threading.Thread(
         target=engine.hilo_monitor, args=(ip_monitor, puerto_monitor), daemon=True
     ).start()
-    threading.Thread(target=engine.hilo_comandos, daemon=True).start()
+    threading.Thread(target=engine.hilo_latido, daemon=True).start()
     threading.Thread(target=engine.hilo_tick, daemon=True).start()
+    threading.Thread(target=engine.hilo_reenvio, daemon=True).start()
 
 
 def menu(engine):
@@ -290,20 +495,26 @@ def menu(engine):
                 time.sleep(3600)
 
         if opcion == "1":
+            operador = input("ID del operario [OP1]: ").strip() or "OP1"
             texto = input(f"Duración en segundos [{DURACION_POR_DEFECTO}]: ").strip()
             try:
                 duracion = int(texto) if texto else DURACION_POR_DEFECTO
             except ValueError:
                 print("Duración no válida")
                 continue
-            engine.solicitar_manual(duracion)
+            engine.solicitar_manual(operador, duracion)
         elif opcion == "2":
             if not engine.finalizar_riego("MENU"):
                 print("No hay ningún riego en curso")
         elif opcion == "3":
             engine.alternar_fallo()
         elif opcion == "4":
-            print(f"Estación {engine.ws_id}: {engine.estado}")
+            print(
+                f"Estación {engine.ws_id}: {engine.estado} | "
+                f"Monitor: {'OK' if engine.monitor_ok else 'SIN CONEXION'} | "
+                f"Central: {'OK' if engine.central_ok else 'Imposible conectar con WM_Central'} | "
+                f"Resultados por confirmar: {len(engine.pendientes)}"
+            )
         elif opcion == "0":
             break
 
@@ -323,14 +534,12 @@ def main():
         print("Los puertos deben ser números")
         sys.exit(1)
 
-    engine = Engine(broker)
+    engine = Engine(broker, os.environ.get("WM_DATA_DIR", "."))
     arrancar(engine, ip_monitor, puerto_monitor)
     try:
         menu(engine)
     except KeyboardInterrupt:
         pass
-    if engine.productor is not None:
-        engine.productor.flush()
     log("Engine detenido")
 
 
