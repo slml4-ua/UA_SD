@@ -18,6 +18,9 @@ import uuid
 import bus
 import db
 import protocol
+from panel import (
+    GRIS, NARANJA, NEGRITA, ROJO, VERDE, VERDE_CLARO, Pantalla, ancho_util, linea,
+)
 
 TOPIC_PETICIONES = "fo_requests"
 TOPIC_TELEMETRIA = "ws_telemetry"
@@ -49,7 +52,7 @@ NOMBRES_ESTADO = {
     db.DESCONECTADA: "desconectada",
 }
 LIMITE_SILENCIO_MONITOR = 10  # s sin mensajes de un Monitor => DESCONECTADA
-
+LINEAS_EVENTOS = 5
 
 class Estacion:
     """Estado en memoria de una estación de riego."""
@@ -85,12 +88,15 @@ productor_listo = threading.Event()
 salida = collections.deque()  # mensajes pendientes de publicar (hilos que no deben esperar)
 salida_cond = threading.Condition()
 
-_print_lock = threading.Lock()
+eventos = collections.deque(maxlen=LINEAS_EVENTOS)
+pantalla = Pantalla()
 
 
 def log(mensaje):
-    with _print_lock:
-        print(f"[{time.strftime('%H:%M:%S')}] {mensaje}", flush=True)
+    texto = f"{time.strftime('%H:%M:%S')} {mensaje}"
+    eventos.append(texto)
+    if not pantalla.interactiva:
+        print(texto, flush=True)
 
 # ------------------------------------------------------------------- Kafka
 
@@ -257,8 +263,8 @@ def procesar_mensaje(texto, conn, ws_id_conexion):
     if operacion == "PING":
         return "OK", ws_id_conexion
 
-        if operacion == "FAULT":
-            averia_detectada(ws_id_conexion)
+    if operacion == "FAULT":
+        averia_detectada(ws_id_conexion)
         return "OK", ws_id_conexion
 
     if operacion == "RECOVERED":
@@ -531,21 +537,108 @@ def orden_central(orden, destino, duracion=DURACION_POR_DEFECTO):
                 a_ws(ws_id, orden, sincrono=False)
                 log(f"{ws_id}: {'BLOQUEADA (fuera de servicio)' if est.bloqueada else 'ACTIVADA'}")
 
-# ------------------------------------------------------------------- panel
+# -------------------------------------------------------------------- panel
 
-def mostrar_estado():
+def fila_estacion(est, volumen, fase, ancho):
+    estado = est.estado
+    riego = est.riego
+    if estado == db.REGANDO and riego is not None:
+        volumen += riego["volumen"]
+    base = f"{est.id:<5.5}{est.ubicacion:<12.12}{volumen:>6.1f} L "
+    if estado == db.DISPONIBLE:
+        return linea(base + "DISPONIBLE", ancho, VERDE)
+    if estado == db.REGANDO:
+        datos = f"{riego['caudal']:.1f}L/m {riego['volumen']:.1f}L {riego['operador']}"
+        return linea(base + "REGANDO " + datos, ancho, VERDE if fase else VERDE_CLARO)
+    if estado == db.FUGA:
+        return linea(base + "FUGA", ancho, ROJO)
+    if estado == db.FUERA_DE_SERVICIO:
+        return linea(base + "FUERA DE SERVICIO", ancho, NARANJA)
+    return linea(base + "DESCONECTADA", ancho, GRIS)
+
+
+def construir_panel(fase):
+    ancho = ancho_util()
+    volumenes = db.volumenes_totales()
     with lock:
-        filas = sorted(estaciones.values(), key=lambda e: e.id)
-        datos = [(e.id, e.ubicacion, e.estado) for e in filas]
-    with _print_lock:
-        print("-" * 60)
-        print(f"{'ID':<8}{'UBICACION':<20}{'ESTADO':<20}")
-        for ws_id, ubicacion, estado in datos:
-            print(f"{ws_id:<8}{ubicacion:<20}{estado:<20}")
-        if not datos:
-            print("(sin estaciones registradas)")
-        print("-" * 60, flush=True)
+        filas = [
+            fila_estacion(e, volumenes.get(e.id, 0.0), fase, ancho)
+            for e in sorted(estaciones.values(), key=lambda x: x.id)
+        ]
+    if not filas:
+        filas = [linea("(sin estaciones registradas)", ancho)]
+    lineas = [
+        linea("WATERMANAGEMENT - CENTRAL", ancho, NEGRITA),
+        linea(f"{'ID':<5}{'UBICACION':<12}{'VOLUMEN':>7}  ESTADO", ancho, NEGRITA),
+    ]
+    lineas += filas
+    lineas.append(linea("Ultimos eventos:", ancho, NEGRITA))
+    recientes = list(eventos)
+    recientes += [""] * (LINEAS_EVENTOS - len(recientes))
+    lineas += [linea(texto, ancho) for texto in recientes]
+    lineas.append(linea("1 Iniciar  2 Bloquear  3 Activar  0 Salir", ancho, NEGRITA))
+    return lineas
 
+
+def hilo_panel():
+    """Refresca el panel cada segundo (en su sitio si hay terminal)."""
+    ultimo_texto = None
+    ultima_impresion = 0.0
+    while True:
+        time.sleep(1)
+        fase = int(time.time()) % 2
+        lineas = construir_panel(fase)
+        if pantalla.interactiva:
+            if not pantalla.refrescar(lineas):
+                pantalla.imprimir(lineas)
+        else:
+            # Sin terminal (logs): solo se imprime cuando cambia algo relevante
+            texto = "\n".join(construir_panel(1))
+            if texto != ultimo_texto or time.time() - ultima_impresion > 30:
+                print(texto, flush=True)
+                ultimo_texto, ultima_impresion = texto, time.time()
+
+
+# --------------------------------------------------------------------- menú
+
+def preguntar_destino():
+    destino = input("Estación (ID o ALL): ").strip()
+    if destino.upper() == "ALL":
+        return "ALL"
+    return destino
+
+
+def menu():
+    """Bucle del menú de Central (solo con terminal interactiva)."""
+    pantalla.imprimir(construir_panel(1))
+    threading.Thread(target=hilo_panel, daemon=True).start()
+    while True:
+        try:
+            opcion = input("> ").strip()
+        except EOFError:
+            while True:
+                time.sleep(3600)
+        if opcion == "0":
+            return
+        if opcion not in ("1", "2", "3"):
+            pantalla.imprimir(construir_panel(1))
+            continue
+        pantalla.pausar()
+        destino = preguntar_destino()
+        if opcion == "1":
+            texto = input(f"Duración en segundos [{DURACION_POR_DEFECTO}]: ").strip()
+            try:
+                duracion = int(texto) if texto else DURACION_POR_DEFECTO
+            except ValueError:
+                log("Duración no válida")
+                pantalla.imprimir(construir_panel(1))
+                continue
+            orden_central("START", destino, duracion)
+        elif opcion == "2":
+            orden_central("BLOCK", destino)
+        else:
+            orden_central("ACTIVATE", destino)
+        pantalla.imprimir(construir_panel(1))
 # -------------------------------------------------------------------- main
 
 def main():
@@ -572,11 +665,15 @@ def main():
     ):
         threading.Thread(target=destino, args=args, daemon=True).start()
     try:
-        while True:
-            mostrar_estado()
-            time.sleep(5)
+        if pantalla.interactiva:
+            menu()
+        else:
+            threading.Thread(target=hilo_panel, daemon=True).start()
+            while True:
+                time.sleep(3600)
     except KeyboardInterrupt:
-        log("Central detenida")
+        pass
+    print("Central detenida")
 
 
 if __name__ == "__main__":
